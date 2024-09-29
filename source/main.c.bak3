@@ -1,0 +1,1161 @@
+#include <gtk/gtk.h>
+#include <vte/vte.h>
+#include <sys/inotify.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <errno.h>
+#include <dirent.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <libgen.h>
+#include <glib.h>
+
+#define FILE_PATH_COLUMN 0
+
+static GtkListStore *store;
+static GtkWidget *tree_view, *window;
+static VteTerminal *terminal;
+static int inotify_fd;
+static char *base_dir;
+static char *current_dir;
+
+// Function declarations
+static void show_new_directory_dialog();
+static void create_new_directory(const char *dir_name);
+static void show_deletion_dialog();
+static void delete_selected_item();
+static int get_directory_depth(const char *dir);
+static gboolean recursive_delete(const char *path);
+static void make_file_executable(const char *path);
+static void make_file_not_executable(const char *path);
+static const char *get_language_from_path(const char *path);
+static void compile_and_run(const char *path, const char *language);
+static gboolean show_confirmation_dialog(const char *message);
+static void create_new_file(const char *file_name);
+static void show_new_file_dialog();
+static void display_directory(const char *dir);
+static void open_file_with_appropriate_application(const char *filepath);
+static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer userdata);
+static gboolean on_button_press(GtkWidget *widget, GdkEventButton *event, gpointer userdata);
+static void on_row_activated(GtkTreeView *treeview, GtkTreePath *path, GtkTreeViewColumn *col, gpointer userdata);
+static GtkWidget* create_tree_view();
+static void on_window_destroy(GtkWidget *widget, gpointer data);
+static char *strip_html_markup(const char *input);
+void run_executable(GtkMenuItem *menu_item, gpointer user_data);
+void make_file_executable_menu(GtkMenuItem *menu_item, gpointer user_data);
+void make_file_not_executable_menu(GtkMenuItem *menu_item, gpointer user_data);
+
+static gboolean has_extension(const char *filename, const char *extension) {
+    const char *dot = strrchr(filename, '.');
+    return dot && !g_strcmp0(dot + 1, extension);
+}
+
+static gboolean show_confirmation_dialog(const char *message) {
+    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(window),
+                                               GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                               GTK_MESSAGE_QUESTION,
+                                               GTK_BUTTONS_OK_CANCEL,
+                                               "%s", message);
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    return (response == GTK_RESPONSE_OK);
+}
+
+static void handle_file_open_error(const char *filepath) {
+    gchar *msg = g_strdup_printf("\nFailed to open '%s'\n", filepath);
+    vte_terminal_feed_child(VTE_TERMINAL(terminal), msg, -1);
+    g_free(msg);
+}
+
+static void open_file_with_appropriate_application(const char *filepath) {
+    struct stat path_stat;
+    if (stat(filepath, &path_stat) != 0 || S_ISDIR(path_stat.st_mode)) {
+        g_print("Attempted to open a directory or invalid path: %s\n", filepath);
+        return;
+    }
+
+    const char *const_argv[3] = {NULL, filepath, NULL};
+    char *argv[3];
+
+    if (has_extension(filepath, "jpg") || has_extension(filepath, "png")) {
+        const_argv[0] = "feh";
+    } else if (has_extension(filepath, "pdf")) {
+        const_argv[0] = "zathura";
+    } else {
+        const_argv[0] = "nvim";
+    }
+
+    for (int i = 0; i < 3; i++) {
+        argv[i] = (char *)const_argv[i];
+    }
+
+    vte_terminal_spawn_async(VTE_TERMINAL(terminal),
+                             VTE_PTY_DEFAULT,
+                             NULL,
+                             argv,
+                             NULL,
+                             G_SPAWN_DEFAULT,
+                             NULL, NULL,
+                             NULL,
+                             -1,
+                             NULL, NULL,
+                             NULL);
+}
+
+static void display_directory(const char *dir) {
+    DIR *d;
+    struct dirent *entry;
+    GtkTreeIter iter;
+    struct stat statbuf;
+    gboolean readme_found = FALSE;
+    char *readme_path = NULL;
+
+    if ((d = opendir(dir)) == NULL) {
+        fprintf(stderr, "Failed to open directory: %s\n", strerror(errno));
+        return;
+    }
+
+    gtk_list_store_clear(store);
+
+    while ((entry = readdir(d)) != NULL) {
+        char *full_path = g_strdup_printf("%s/%s", dir, entry->d_name);
+        if (stat(full_path, &statbuf) == -1) {
+            g_free(full_path);
+            continue;
+        }
+
+        gchar *display_name;
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0 && strcmp(entry->d_name, "codeWS") != 0) {
+            if (S_ISDIR(statbuf.st_mode)) {
+                display_name = g_markup_printf_escaped("<span foreground='blue'>%s</span>", entry->d_name);
+            } else if (statbuf.st_mode & S_IXUSR) {
+                display_name = g_markup_printf_escaped("<span foreground='red'>%s</span>", entry->d_name);
+            } else {
+                display_name = g_strdup(entry->d_name);
+            }
+
+            gtk_list_store_append(store, &iter);
+            gtk_list_store_set(store, &iter, 0, display_name, 1, entry->d_name, -1);
+            g_free(display_name);
+
+            if (g_ascii_strcasecmp(entry->d_name, "readme.md") == 0) {
+                readme_found = TRUE;
+                readme_path = g_strdup_printf("%s/%s", dir, entry->d_name);
+            }
+        }
+        g_free(full_path);
+    }
+    closedir(d);
+
+    if (readme_found && readme_path) {
+        open_file_with_appropriate_application(readme_path);
+        g_free(readme_path);
+    }
+}
+
+static void navigate_up_directory() {
+    if (strcmp(current_dir, base_dir) == 0) {
+        return;
+    }
+
+    char *last_slash = strrchr(current_dir, '/');
+    if (last_slash != NULL) {
+        *last_slash = '\0';
+        if (strcmp(current_dir, base_dir) >= 0) {
+            display_directory(current_dir);
+        } else {
+            strcpy(current_dir, base_dir);
+            display_directory(current_dir);
+        }
+    }
+}
+
+static char *strip_html_markup(const char *input) {
+    if (input == NULL) return NULL;
+
+    GError *error = NULL;
+    GRegex *regex = g_regex_new("<[^>]*>", 0, 0, &error);
+    if (error != NULL) {
+        g_print("Regex error: %s\n", error->message);
+        g_error_free(error);
+        return NULL;
+    }
+
+    gchar *stripped = g_regex_replace_literal(regex, input, -1, 0, "", 0, NULL);
+    g_regex_unref(regex);
+
+    return stripped;
+}
+
+gboolean is_executable(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return st.st_mode & S_IXUSR;
+    }
+    return FALSE;
+}
+
+static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer userdata) {
+    if (event->keyval == GDK_KEY_BackSpace && !vte_terminal_get_has_selection(VTE_TERMINAL(terminal))) {
+        navigate_up_directory();
+        return TRUE;
+    }
+    if ((event->state & GDK_CONTROL_MASK) && event->keyval == GDK_KEY_n) {
+        show_new_directory_dialog();
+        return TRUE;
+    }
+    if ((event->state & GDK_CONTROL_MASK) && event->keyval == GDK_KEY_d) {
+        show_deletion_dialog();
+        return TRUE;
+    }
+    if ((event->state & GDK_CONTROL_MASK) && event->keyval == GDK_KEY_r) {
+        GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree_view));
+        GtkTreeModel *model;
+        GtkTreeIter iter;
+        gchar *filename;
+
+        if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+            gtk_tree_model_get(model, &iter, 0, &filename, -1);
+            char *clean_filename = strip_html_markup(filename);
+            char *path = g_strdup_printf("%s/%s", current_dir, clean_filename);
+            const char *language = get_language_from_path(path);
+            char *clean_path = strip_html_markup(path);
+
+            if (clean_path) {
+                g_print("Cleaned path: %s\n", clean_path);  // Debug print
+                compile_and_run(clean_path, language);
+                g_free(clean_path);
+            } else {
+                g_print("Failed to clean path: %s\n", path);  // Debug print
+            }
+
+            g_free(clean_filename);
+            g_free(filename);
+            g_free(path);
+        }
+        return TRUE;
+    }
+    if ((event->state & GDK_CONTROL_MASK) && event->keyval == GDK_KEY_e) {
+        GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree_view));
+        GtkTreeModel *model;
+        GtkTreeIter iter;
+        gchar *filename;
+
+        if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+            gtk_tree_model_get(model, &iter, 0, &filename, -1);
+            char *clean_filename = strip_html_markup(filename);
+            char *path = g_strdup_printf("%s/%s", current_dir, clean_filename);
+            make_file_executable(path);
+            display_directory(current_dir);
+            g_free(clean_filename);
+            g_free(filename);
+            g_free(path);
+        }
+        return TRUE;
+    }
+    if ((event->state & GDK_CONTROL_MASK) && event->keyval == GDK_KEY_f) {
+        show_new_file_dialog();
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean on_button_press(GtkWidget *widget, GdkEventButton *event, gpointer userdata) {
+    if (event->type == GDK_BUTTON_PRESS && event->button == 3) {
+        GtkTreePath *path;
+        GtkTreeView *tree_view = GTK_TREE_VIEW(widget);
+
+        if (gtk_tree_view_get_path_at_pos(tree_view, (gint)event->x, (gint)event->y, &path, NULL, NULL, NULL)) {
+            GtkTreeModel *model = gtk_tree_view_get_model(tree_view);
+            GtkTreeIter iter;
+            if (gtk_tree_model_get_iter(model, &iter, path)) {
+                gchar *file_name;
+                gtk_tree_model_get(model, &iter, 1, &file_name, -1);
+                
+                // Construct the full path
+                gchar *file_path = g_strdup_printf("%s/%s", current_dir, file_name);
+
+                struct stat path_stat;
+                if (stat(file_path, &path_stat) == 0 && !S_ISDIR(path_stat.st_mode)) {  // Check if not a directory
+                    GtkWidget *menu = gtk_menu_new();
+
+                    // Create and add "Make File Executable" item
+                    GtkWidget *make_exec_item = gtk_menu_item_new_with_label("Make File Executable");
+                    g_signal_connect(make_exec_item, "activate", G_CALLBACK(make_file_executable_menu), g_strdup(file_path));
+                    gtk_menu_shell_append(GTK_MENU_SHELL(menu), make_exec_item);
+
+                    // Create and add "Make File Not Executable" item
+                    GtkWidget *make_not_exec_item = gtk_menu_item_new_with_label("Make File Not Executable");
+                    g_signal_connect(make_not_exec_item, "activate", G_CALLBACK(make_file_not_executable_menu), g_strdup(file_path));
+                    gtk_menu_shell_append(GTK_MENU_SHELL(menu), make_not_exec_item);
+
+                    // Create and add "Run" item if the file is executable
+                    if (is_executable(file_path)) {
+                        GtkWidget *run_item = gtk_menu_item_new_with_label("Run");
+                        g_signal_connect(run_item, "activate", G_CALLBACK(run_executable), g_strdup(file_path));
+                        gtk_menu_shell_append(GTK_MENU_SHELL(menu), run_item);
+                    }
+
+                    gtk_widget_show_all(menu);
+                    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
+                } else {
+                    g_print("Right-clicked on a directory or invalid path: %s\n", file_path);
+                }
+
+                g_free(file_path);
+                g_free(file_name);
+            }
+            gtk_tree_path_free(path);
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void run_executable(GtkMenuItem *menu_item, gpointer user_data) {
+    const char *file_path = (const char *)user_data;
+    gchar *clean_path = g_strdup(file_path); // Duplicate the file path
+    gchar *command = g_strdup_printf("clear && '%s'", clean_path); // Use single quotes to handle spaces in paths
+    gchar *argv[] = {"bash", "-c", command, NULL};
+
+    g_print("Running executable: %s\n", clean_path); // Debug print
+    g_print("Command: %s\n", command); // Print the command for debugging
+
+    vte_terminal_spawn_async(
+        VTE_TERMINAL(terminal),
+        VTE_PTY_DEFAULT,
+        current_dir,  // Set the working directory
+        argv,
+        NULL,
+        G_SPAWN_DEFAULT,
+        NULL, NULL, NULL, -1,
+        NULL, NULL, NULL);
+
+    g_free(command);
+    g_free(clean_path);
+    g_free((char *)file_path);  // Free the strdup-ed file path
+}
+
+void make_file_executable_menu(GtkMenuItem *menu_item, gpointer user_data) {
+    const char *file_path = (const char *)user_data;
+    make_file_executable(file_path);
+    display_directory(current_dir);  // Update the directory view immediately
+    g_free((char *)file_path);  // Free the strdup-ed file path
+}
+
+void make_file_not_executable_menu(GtkMenuItem *menu_item, gpointer user_data) {
+    const char *file_path = (const char *)user_data;
+    make_file_not_executable(file_path);
+    display_directory(current_dir);  // Update the directory view immediately
+    g_free((char *)file_path);  // Free the strdup-ed file path
+}
+
+static void on_row_activated(GtkTreeView *treeview, GtkTreePath *path, GtkTreeViewColumn *col, gpointer userdata) {
+    GtkTreeModel *model = gtk_tree_view_get_model(treeview);
+    GtkTreeIter iter;
+    gchar *actual_name;
+
+    if (gtk_tree_model_get_iter(model, &iter, path)) {
+        gtk_tree_model_get(model, &iter, 1, &actual_name, -1);
+
+        char *new_path = g_strdup_printf("%s/%s", current_dir, actual_name);
+        struct stat path_stat;
+        if (stat(new_path, &path_stat) == 0) {
+            if (S_ISDIR(path_stat.st_mode)) {
+                g_free(current_dir);
+                current_dir = new_path;
+                display_directory(current_dir);
+            } else {
+                open_file_with_appropriate_application(new_path);
+                g_free(new_path);
+            }
+        } else {
+            g_printerr("Failed to access %s: %s\n", new_path, strerror(errno));
+            g_free(new_path);
+        }
+        g_free(actual_name);
+    }
+}
+
+static GtkWidget* create_tree_view() {
+    tree_view = gtk_tree_view_new();
+    store = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING);
+    gtk_tree_view_set_model(GTK_TREE_VIEW(tree_view), GTK_TREE_MODEL(store));
+
+    GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+    GtkTreeViewColumn *column = gtk_tree_view_column_new_with_attributes("Entries", renderer, "markup", 0, NULL);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), column);
+
+    g_signal_connect(tree_view, "row-activated", G_CALLBACK(on_row_activated), NULL);
+    g_signal_connect(tree_view, "key-press-event", G_CALLBACK(on_key_press), NULL);
+    g_signal_connect(tree_view, "button-press-event", G_CALLBACK(on_button_press), NULL);
+
+    return tree_view;
+}
+
+static void on_window_destroy(GtkWidget *widget, gpointer data) {
+    close(inotify_fd);
+    g_free(base_dir);
+    g_free(current_dir);
+    gtk_main_quit();
+}
+
+static char *extract_first_directory(const char *path) {
+    if (!path) return NULL;
+    path += strlen(base_dir);
+    if (*path == '/') path++;
+
+    const char *end = strchr(path, '/');
+    if (!end) end = path + strlen(path);
+
+    size_t len = end - path;
+    char *dir = malloc(len + 1);
+    if (dir) {
+        strncpy(dir, path, len);
+        dir[len] = '\0';
+    }
+    return dir;
+}
+
+static const char *get_language_from_path(const char *path) {
+    if (!path) {
+        printf("Error: Path is NULL\n");
+        return NULL;
+    }
+
+    char *language_dir = extract_first_directory(path);
+    if (!language_dir) {
+        printf("No language directory found or error in path processing.\n");
+        return NULL;
+    }
+
+    const char *language = NULL;
+    if (strcmp(language_dir, "C") == 0) {
+        language = "C";
+    } else if (strcmp(language_dir, "Python3") == 0) {
+        language = "Python3";
+    } else if (strcmp(language_dir, "Asm") == 0) {
+        language = "Assembly";
+    }
+
+    if (language) {
+        printf("Detected language: %s\n", language);
+    } else {
+        printf("No recognized language found in the directory name.\n");
+    }
+
+    free(language_dir);
+    return language;
+}
+
+static void compile_and_run(const char *path, const char *language) {
+    if (path == NULL) {
+        g_print("Error: Path is NULL\n");
+        return;
+    }
+
+    char *clean_path = strip_html_markup(path);
+    if (clean_path == NULL) {
+        g_print("Failed to clean path from HTML markup.\n");
+        return;
+    }
+
+    gchar *compile_cmd = NULL;
+    gchar *cmd = g_strdup_printf("Are you sure you want to compile and run this %s program?", language);
+    if (show_confirmation_dialog(cmd)) {
+        gchar *dir_path = g_path_get_dirname(clean_path);
+        if (dir_path == NULL) {
+            g_print("Error: Unable to determine directory from path: %s\n", clean_path);
+            g_free(cmd);
+            g_free(clean_path);
+            return;
+        }
+
+        if (strcasecmp(language, "C") == 0) {
+            compile_cmd = g_strdup_printf("clear && cd '%s' && make clean && make", dir_path);
+        } else if (strcasecmp(language, "Python3") == 0) {
+            compile_cmd = g_strdup_printf("clear && cd %s && python3 %s\n", dir_path, clean_path);
+        } else if (strcasecmp(language, "Assembly") == 0) {
+            compile_cmd = g_strdup_printf("clear && cd %s && nasm -f elf64 %s -o %s.o && ld %s.o -o %s && ./%s\n", dir_path, clean_path, clean_path, clean_path, clean_path, clean_path);
+        }
+
+        g_free(dir_path);
+
+        if (compile_cmd) {
+            g_print("Compile command: %s\n", compile_cmd);
+            vte_terminal_spawn_async(
+                VTE_TERMINAL(terminal),
+                VTE_PTY_DEFAULT,
+                NULL,
+                (char *[]){ "bash", "-c", compile_cmd, NULL },
+                NULL,
+                G_SPAWN_DEFAULT,
+                NULL, NULL, NULL, -1,
+                NULL, NULL, NULL);
+            g_free(compile_cmd);
+        } else {
+            g_print("Unsupported language: %s\n", language);
+        }
+    }
+    g_free(cmd);
+    g_free(clean_path);
+}
+
+static void make_file_executable(const char *path) {
+    if (path == NULL) return;
+    gchar *command = g_strdup_printf("chmod +x \"%s\"", path);
+    gchar *argv[] = {"bash", "-c", command, NULL};
+    VteTerminal *vte_terminal = VTE_TERMINAL(terminal);
+
+    vte_terminal_spawn_async(
+        vte_terminal,
+        VTE_PTY_DEFAULT,
+        current_dir,
+        argv,
+        NULL,
+        G_SPAWN_DEFAULT,
+        NULL, NULL, NULL, -1,
+        NULL, NULL, NULL);
+
+    g_free(command);
+}
+
+static void make_file_not_executable(const char *path) {
+    if (path == NULL) return;
+    gchar *command = g_strdup_printf("chmod -x \"%s\"", path);
+    gchar *argv[] = {"bash", "-c", command, NULL};
+    VteTerminal *vte_terminal = VTE_TERMINAL(terminal);
+
+    vte_terminal_spawn_async(
+        vte_terminal,
+        VTE_PTY_DEFAULT,
+        current_dir,
+        argv,
+        NULL#include <gtk/gtk.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <stdio.h>
+
+#define MAX_COMMAND_LENGTH 256
+#define SSH_LIST_FILE_PATH "/home/klein/codeWS/C/ssh_gui/ssh_list.txt"
+#define PRIVATE_KEY_PATH "/home/klein/.ssh/id_rsa"
+
+// Function to get local IP address
+void get_local_ip(char *ip_buffer) {
+    struct ifaddrs *ifaddr, *ifa;
+    int family, s;
+    char host[NI_MAXHOST];
+
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        exit(EXIT_FAILURE);
+    }
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+
+        family = ifa->ifa_addr->sa_family;
+
+        if (family == AF_INET) {
+            s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                            host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+            if (s != 0) {
+                printf("getnameinfo() failed: %s\n", gai_strerror(s));
+                exit(EXIT_FAILURE);
+            }
+
+            if (strcmp(ifa->ifa_name, "lo") != 0) {
+                strncpy(ip_buffer, host, NI_MAXHOST);
+                break;
+            }
+        }
+    }
+
+    freeifaddrs(ifaddr);
+}
+
+// Function to get public IP address
+void get_public_ip(char *ip_buffer) {
+    FILE *fp;
+    char path[1035];
+
+    fp = popen("curl -s ifconfig.me", "r");
+    if (fp == NULL) {
+        printf("Failed to run command\n");
+        exit(1);
+    }
+
+    if (fgets(path, sizeof(path) - 1, fp) != NULL) {
+        strncpy(ip_buffer, path, 1035);
+    }
+
+    pclose(fp);
+}
+
+// Function to get SSID using nmcli
+void get_ssid(char *ssid_buffer) {
+    FILE *fp;
+    char path[1035];
+
+    fp = popen("nmcli -t -f active,ssid dev wifi | egrep '^yes' | cut -d: -f2", "r");
+    if (fp == NULL) {
+        printf("Failed to run command\n");
+        exit(1);
+    }
+
+    if (fgets(path, sizeof(path) - 1, fp) != NULL) {
+        strncpy(ssid_buffer, path, 1035);
+    }
+
+    pclose(fp);
+}
+
+// Function to get SSH service status
+void get_ssh_service_status(char *ssh_service_status) {
+    FILE *fp;
+    char path[1035];
+
+    fp = popen("systemctl is-active ssh", "r");
+    if (fp == NULL) {
+        printf("Failed to run command\n");
+        exit(1);
+    }
+
+    if (fgets(path, sizeof(path) - 1, fp) != NULL) {
+        strncpy(ssh_service_status, path, 1035);
+    }
+
+    pclose(fp);
+}
+
+// Function to check if port 22 is open and display relevant SSH information
+void get_port_22_status(char *port_22_status) {
+    FILE *fp;
+    char path[1035];
+
+    fp = popen("ss -tunlp | grep ':22 '", "r");
+    if (fp == NULL) {
+        printf("Failed to run command\n");
+        exit(1);
+    }
+
+    // Clear the buffer before appending
+    port_22_status[0] = '\0';
+
+    while (fgets(path, sizeof(path) - 1, fp) != NULL) {
+        // Append the relevant lines to the status buffer
+        strcat(port_22_status, path);
+    }
+
+    pclose(fp);
+}
+
+// Function to get active connections using ss
+void get_active_connections(char *conn_buffer) {
+    FILE *fp;
+    char path[1035];
+
+    fp = popen("ss -tunap", "r");
+    if (fp == NULL) {
+        printf("Failed to run command\n");
+        exit(1);
+    }
+
+    while (fgets(path, sizeof(path) - 1, fp) != NULL) {
+        strcat(conn_buffer, path);
+    }
+
+    pclose(fp);
+}
+
+// Function to execute SSH command
+void execute_ssh(GtkWidget *widget, gpointer data) {
+    const char *command = (const char *)data;
+
+    char full_command[MAX_COMMAND_LENGTH];
+    snprintf(full_command, sizeof(full_command), "ssh -i %s %s", PRIVATE_KEY_PATH, command);
+
+    printf("Executing command: %s\n", full_command); // Debugging output
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Child process
+        printf("Attempting to execute alacritty with command: %s\n", full_command);
+        execlp("alacritty", "alacritty", "-e", "bash", "-c", full_command, NULL);
+        printf("alacritty failed, attempting to execute st with command: %s\n", full_command);
+        execlp("st", "st", "-e", "bash", "-c", full_command, NULL);
+        perror("execlp");
+        exit(EXIT_FAILURE);
+    } else if (pid < 0) {
+        perror("fork");
+    } else {
+        // Parent process
+        gtk_main_quit(); // Close the GTK main loop
+    }
+}
+
+// Function to create buttons for each SSH command
+void create_buttons(GtkWidget *box) {
+    FILE *file = fopen(SSH_LIST_FILE_PATH, "r");
+    if (!file) {
+        perror("Error opening file");
+        printf("Path attempted: %s\n", SSH_LIST_FILE_PATH); // Debugging output
+        return;
+    }
+
+    char line[MAX_COMMAND_LENGTH];
+    GtkWidget *prev_button = NULL;
+
+    while (fgets(line, sizeof(line), file)) {
+        // Remove newline character from the line
+        line[strcspn(line, "\n")] = 0;
+
+        // Find the first space to locate the start of the SSH command
+        char *command = strchr(line, ' ');
+        if (command && strlen(command) > 1) {
+            command++; // Skip the space to get the actual command
+            GtkWidget *button = gtk_button_new_with_label(command);
+            gtk_widget_set_name(button, "ssh-button"); // Set name for CSS
+            gtk_widget_set_can_focus(button, TRUE);
+            g_signal_connect(button, "clicked", G_CALLBACK(execute_ssh), g_strdup(command));
+            gtk_box_pack_start(GTK_BOX(box), button, TRUE, TRUE, 0);
+        }
+    }
+
+    fclose(file);
+}
+
+// Function to open SSH instructions in Neovim
+void open_ssh_instructions(GtkWidget *widget, gpointer data) {
+    const char *file_path = (const char *)data;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Child process
+        execlp("alacritty", "alacritty", "-e", "nvim", file_path, NULL);
+        perror("execlp");
+        exit(EXIT_FAILURE);
+    } else if (pid < 0) {
+        perror("fork");
+    } else {
+        // Parent process
+        gtk_main_quit(); // Close the GTK main loop
+    }
+}
+
+// Key press event handler for buttons
+gboolean on_button_key_press(GtkWidget *widget, GdkEventKey *event, gpointer data) {
+    GtkWidget *parent = gtk_widget_get_parent(widget);
+    GList *children = gtk_container_get_children(GTK_CONTAINER(parent));
+    GList *current = g_list_find(children, widget);
+
+    switch (event->keyval) {
+        case GDK_KEY_Up:
+        case GDK_KEY_Left:
+            if (current->prev) {
+                gtk_widget_grab_focus(GTK_WIDGET(current->prev->data));
+            }
+            break;
+        case GDK_KEY_Down:
+        case GDK_KEY_Right:
+            if (current->next) {
+                gtk_widget_grab_focus(GTK_WIDGET(current->next->data));
+            }
+            break;
+        default:
+            return FALSE;
+    }
+    return TRUE;
+}
+
+// Key press event handler for window
+gboolean on_window_key_press(GtkWidget *widget, GdkEventKey *event, gpointer data) {
+    if (event->keyval == GDK_KEY_q || event->keyval == GDK_KEY_Escape || event->keyval == GDK_KEY_Delete) {
+        gtk_main_quit();
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void apply_css(GtkWidget *widget, GtkStyleProvider *provider) {
+    gtk_style_context_add_provider(gtk_widget_get_style_context(widget), provider, GTK_STYLE_PROVIDER_PRIORITY_USER);
+    if (GTK_IS_CONTAINER(widget)) {
+        gtk_container_forall(GTK_CONTAINER(widget), (GtkCallback)apply_css, provider);
+    }
+}
+
+int main(int argc, char *argv[]) {
+    gtk_init(&argc, &argv);
+
+    // Get system info
+    char local_ip[NI_MAXHOST] = {0};
+    char public_ip[1035] = {0};
+    char ssid[1035] = {0};
+    char username[256] = {0};
+    char ssh_service_status[1035] = {0};
+    char port_22_status[2048] = {0};
+    char active_connections[2048] = {0};
+    char info[512]; // Declare the info variable
+
+    get_local_ip(local_ip);
+    get_public_ip(public_ip);
+    get_ssid(ssid);
+    getlogin_r(username, sizeof(username));
+    get_ssh_service_status(ssh_service_status);
+    get_port_22_status(port_22_status);
+    get_active_connections(active_connections);
+
+    // Create CSS provider and load CSS
+    GtkCssProvider *cssProvider = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(cssProvider,
+        "* { font-family: 'Arial'; }\n"
+        "#app-title { font-size: 24px; font-weight: bold; color: #00FF00; }\n"
+        "#info-label { font-size: 14px; color: #FFFFFF; }\n"
+        "#ssh-button { font-size: 14px; background-color: #1E1E1E; color: #000000; border-radius: 4px; padding: 5px 10px; }\n"
+        "#ssh-button:hover { background-color: #333333; }\n"
+        "window { background-color: #2E2E2E; }\n",
+        -1, NULL);
+
+    // Create GTK window
+    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(window), "SSH Commands");
+    gtk_window_set_default_size(GTK_WINDOW(window), 800, 600);
+    g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+    g_signal_connect(window, "key-press-event", G_CALLBACK(on_window_key_press), NULL);
+
+    // Create a horizontal box to organize sections
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_container_add(GTK_CONTAINER(window), hbox);
+
+    // Create left box for SSH and firewall info
+    GtkWidget *left_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_box_pack_start(GTK_BOX(hbox), left_box, FALSE, FALSE, 10);
+
+    // Add SSH service status to left box
+    GtkWidget *label = gtk_label_new("SSH Service Status:");
+    gtk_widget_set_name(label, "info-label");
+    gtk_box_pack_start(GTK_BOX(left_box), label, FALSE, FALSE, 5);
+
+    char ssh_status_markup[512];
+    if (strncmp(ssh_service_status, "active", 6) == 0) {
+        snprintf(ssh_status_markup, sizeof(ssh_status_markup), "<span foreground='green'>Active ✓</span>");
+    } else {
+        snprintf(ssh_status_markup, sizeof(ssh_status_markup), "<span foreground='red'>Inactive ✗</span>");
+    }
+
+    GtkWidget *ssh_service_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(ssh_service_label), ssh_status_markup);
+    gtk_widget_set_name(ssh_service_label, "info-label");
+    gtk_box_pack_start(GTK_BOX(left_box), ssh_service_label, FALSE, FALSE, 5);
+
+    label = gtk_label_new("Port 22 Status:");
+    gtk_widget_set_name(label, "info-label");
+    gtk_box_pack_start(GTK_BOX(left_box), label, FALSE, FALSE, 5);
+
+    GtkWidget *port_22_text_view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(port_22_text_view), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(port_22_text_view), FALSE);
+    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(port_22_text_view));
+    gtk_text_buffer_set_text(buffer, port_22_status, -1);
+    gtk_box_pack_start(GTK_BOX(left_box), port_22_text_view, TRUE, TRUE, 5);
+
+    // Create center box for user info and buttons
+    GtkWidget *center_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_box_pack_start(GTK_BOX(hbox), center_box, TRUE, TRUE, 10);
+
+    // Add application title to center box
+    label = gtk_label_new("SSH Command Center");
+    gtk_widget_set_name(label, "app-title");
+    gtk_box_pack_start(GTK_BOX(center_box), label, FALSE, FALSE, 10);
+
+    // Add system info labels to center box
+    snprintf(info, sizeof(info), "Username: %s", username);
+    label = gtk_label_new(info);
+    gtk_widget_set_name(label, "info-label");
+    gtk_box_pack_start(GTK_BOX(center_box), label, FALSE, FALSE, 5);
+
+    snprintf(info, sizeof(info), "Local IP: %s", local_ip);
+    label = gtk_label_new(info);
+    gtk_widget_set_name(label, "info-label");
+    gtk_box_pack_start(GTK_BOX(center_box), label, FALSE, FALSE, 5);
+
+    snprintf(info, sizeof(info), "Public IP: %s", public_ip);
+    label = gtk_label_new(info);
+    gtk_widget_set_name(label, "info-label");
+    gtk_box_pack_start(GTK_BOX(center_box), label, FALSE, FALSE, 5);
+
+    snprintf(info, sizeof(info), "SSID: %s", ssid);
+    label = gtk_label_new(info);
+    gtk_widget_set_name(label, "info-label");
+    gtk_box_pack_start(GTK_BOX(center_box), label, FALSE, FALSE, 5);
+
+    // Create buttons for SSH commands
+    GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    create_buttons(button_box);
+    gtk_box_pack_start(GTK_BOX(center_box), button_box, FALSE, FALSE, 5);
+
+    // Add button to open SSH instructions in Neovim
+    GtkWidget *edit_button = gtk_button_new_with_label("Edit SSH Instructions");
+    gtk_widget_set_name(edit_button, "ssh-button");
+    gtk_widget_set_can_focus(edit_button, TRUE);
+    g_signal_connect(edit_button, "clicked", G_CALLBACK(open_ssh_instructions), (gpointer)SSH_LIST_FILE_PATH);
+    gtk_box_pack_start(GTK_BOX(center_box), edit_button, FALSE, FALSE, 5);
+
+    // Create right box for active connections
+    GtkWidget *right_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_box_pack_start(GTK_BOX(hbox), right_box, TRUE, TRUE, 10);
+
+    // Add active connections to right box
+    label = gtk_label_new("Active Connections:");
+    gtk_widget_set_name(label, "info-label");
+    gtk_box_pack_start(GTK_BOX(right_box), label, FALSE, FALSE, 5);
+
+    GtkWidget *conn_text_view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(conn_text_view), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(conn_text_view), FALSE);
+    buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(conn_text_view));
+    gtk_text_buffer_set_text(buffer, active_connections, -1);
+    gtk_box_pack_start(GTK_BOX(right_box), conn_text_view, TRUE, TRUE, 5);
+
+    // Apply CSS to all widgets
+    apply_css(window, GTK_STYLE_PROVIDER(cssProvider));
+
+    // Set up key press event handlers for buttons
+    GList *buttons = gtk_container_get_children(GTK_CONTAINER(button_box));
+    for (GList *iter = buttons; iter != NULL; iter = iter->next) {
+        g_signal_connect(iter->data, "key-press-event", G_CALLBACK(on_button_key_press), NULL);
+    }
+    g_signal_connect(edit_button, "key-press-event", G_CALLBACK(on_button_key_press), NULL);
+
+    gtk_widget_show_all(window);
+    gtk_main();
+
+    return 0;
+},
+        G_SPAWN_DEFAULT,
+        NULL, NULL, NULL, -1,
+        NULL, NULL, NULL);
+
+    g_free(command);
+}
+
+static void create_new_file(const char *file_name) {
+    if (file_name == NULL) return;
+
+    gchar *full_path = g_strdup_printf("%s/%s", current_dir, file_name);
+    FILE *file = fopen(full_path, "w");
+    if (file) {
+        fclose(file);
+    } else {
+        g_print("Error creating file: %s\n", strerror(errno));
+    }
+    g_free(full_path);
+}
+
+static void show_new_file_dialog() {
+    GtkWidget *dialog, *content_area, *entry;
+    dialog = gtk_dialog_new_with_buttons("New File", GTK_WINDOW(window),
+                                         GTK_DIALOG_MODAL,
+                                         "_OK", GTK_RESPONSE_OK,
+                                         "_Cancel", GTK_RESPONSE_CANCEL,
+                                         NULL);
+    content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    entry = gtk_entry_new();
+    gtk_container_add(GTK_CONTAINER(content_area), entry);
+    gtk_widget_show_all(dialog);
+
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+    if (response == GTK_RESPONSE_OK) {
+        const char *file_name = gtk_entry_get_text(GTK_ENTRY(entry));
+        create_new_file(file_name);
+        display_directory(current_dir);
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void show_new_directory_dialog() {
+    GtkWidget *dialog, *content_area, *entry;
+    dialog = gtk_dialog_new_with_buttons("New Directory", GTK_WINDOW(window),
+                                         GTK_DIALOG_MODAL,
+                                         "_OK", GTK_RESPONSE_OK,
+                                         "_Cancel", GTK_RESPONSE_CANCEL,
+                                         NULL);
+    content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    entry = gtk_entry_new();
+    gtk_container_add(GTK_CONTAINER(content_area), entry);
+    gtk_widget_show_all(dialog);
+
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+    if (response == GTK_RESPONSE_OK) {
+        const char *dir_name = gtk_entry_get_text(GTK_ENTRY(entry));
+        create_new_directory(dir_name);
+        display_directory(current_dir);
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void create_new_directory(const char *dir_name) {
+    if (dir_name == NULL) return;
+
+    gchar *full_path = g_strdup_printf("%s/%s", current_dir, dir_name);
+    if (mkdir(full_path, 0755) == -1) {
+        g_print("Error creating directory: %s\n", strerror(errno));
+    } else {
+        display_directory(current_dir);
+    }
+    g_free(full_path);
+}
+
+static int get_directory_depth(const char *dir) {
+    const char *base = base_dir;
+    const char *tmp = dir;
+
+    while (*base != '\0' && *tmp == *base) {
+        base++;
+        tmp++;
+    }
+
+    int depth = 0;
+    while (*tmp != '\0') {
+        if (*tmp == '/') {
+            depth++;
+        }
+        tmp++;
+    }
+
+    return depth;
+}
+
+static gboolean recursive_delete(const char *path) {
+    DIR *d = opendir(path);
+    if (d == NULL) {
+        g_printerr("Failed to open directory for deletion: %s\n", strerror(errno));
+        return FALSE;
+    }
+
+    struct dirent *entry;
+    gboolean result = TRUE;
+
+    while ((entry = readdir(d)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 || strcmp(entry->d_name, "codeWS") == 0) {
+            continue;
+        }
+
+        char *full_path = g_strdup_printf("%s/%s", path, entry->d_name);
+        if (entry->d_type == DT_DIR) {
+            if (!recursive_delete(full_path)) {
+                result = FALSE;
+                g_free(full_path);
+                break;
+            }
+        } else {
+            if (remove(full_path) != 0) {
+                g_printerr("Failed to delete file: %s\n", strerror(errno));
+                result = FALSE;
+                g_free(full_path);
+                break;
+            }
+        }
+        g_free(full_path);
+    }
+
+    closedir(d);
+
+    if (result) {
+        if (rmdir(path) != 0) {
+            g_printerr("Failed to delete directory: %s\n", strerror(errno));
+            result = FALSE;
+        }
+    }
+
+    return result;
+}
+
+static void show_deletion_dialog() {
+    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(window),
+                                               GTK_DIALOG_MODAL,
+                                               GTK_MESSAGE_WARNING,
+                                               GTK_BUTTONS_OK_CANCEL,
+                                               "Are you sure you want to delete the selected item?");
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    if (response == GTK_RESPONSE_OK) {
+        delete_selected_item();
+    }
+}
+
+static void delete_selected_item() {
+    GtkTreeModel *model;
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree_view));
+    GtkTreeIter iter;
+    gchar *actual_name;
+
+    if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+        gtk_tree_model_get(model, &iter, 1, &actual_name, -1);
+        char *full_path = g_strdup_printf("%s/%s", current_dir, actual_name);
+
+        if (g_file_test(full_path, G_FILE_TEST_IS_DIR)) {
+            if (!recursive_delete(full_path)) {
+                g_printerr("Failed to delete directory: %s\n", strerror(errno));
+            }
+        } else {
+            if (remove(full_path) != 0) {
+                g_printerr("Failed to delete file: %s\n", strerror(errno));
+            }
+        }
+
+        g_free(full_path);
+        g_free(actual_name);
+        display_directory(current_dir);
+    }
+}
+
+int main(int argc, char *argv[]) {
+    gtk_init(&argc, &argv);
+
+    char *home_dir = getenv("HOME");
+    if (home_dir == NULL) {
+        fprintf(stderr, "Environment variable HOME is not set.\n");
+        return EXIT_FAILURE;
+    }
+
+    base_dir = g_strdup_printf("%s/codeWS", home_dir);
+    current_dir = strdup(base_dir);
+
+    inotify_fd = inotify_init();
+    if (inotify_fd < 0) {
+        perror("inotify_init");
+        return EXIT_FAILURE;
+    }
+
+    inotify_add_watch(inotify_fd, current_dir, IN_CREATE | IN_DELETE | IN_MODIFY);
+
+    window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    g_signal_connect(window, "destroy", G_CALLBACK(on_window_destroy), NULL);
+    gtk_window_set_title(GTK_WINDOW(window), "Code Workshop");
+    gtk_window_set_default_size(GTK_WINDOW(window), 1200, 600);
+
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_container_add(GTK_CONTAINER(window), hbox);
+
+    GtkWidget *view = create_tree_view();
+    gtk_box_pack_start(GTK_BOX(hbox), view, FALSE, FALSE, 5);
+
+    terminal = VTE_TERMINAL(vte_terminal_new());
+    gtk_box_pack_start(GTK_BOX(hbox), GTK_WIDGET(terminal), TRUE, TRUE, 5);
+
+    display_directory(current_dir);
+
+    gtk_widget_show_all(window);
+    gtk_main();
+
+    return 0;
+}

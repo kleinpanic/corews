@@ -1,0 +1,59 @@
+!_TAG_FILE_FORMAT	2	/extended format; --format=1 will not append ;" to lines/
+!_TAG_FILE_SORTED	1	/0=unsorted, 1=sorted, 2=foldcase/
+!_TAG_OUTPUT_EXCMD	mixed	/number, pattern, mixed, or combineV2/
+!_TAG_OUTPUT_FILESEP	slash	/slash or backslash/
+!_TAG_OUTPUT_MODE	u-ctags	/u-ctags or e-ctags/
+!_TAG_PATTERN_LENGTH_LIMIT	96	/0 for no limit/
+!_TAG_PROC_CWD	/home/klein/codeWS/C/corews/test3/	//
+!_TAG_PROGRAM_AUTHOR	Universal Ctags Team	//
+!_TAG_PROGRAM_NAME	Universal Ctags	/Derived from Exuberant Ctags/
+!_TAG_PROGRAM_URL	https://ctags.io/	/official site/
+!_TAG_PROGRAM_VERSION	5.9.0	//
+$(TARGET)	makefile	/^$(TARGET): $(OBJS)$/;"	t
+%.o	makefile	/^%.o: %.c$/;"	t
+CC	makefile	/^CC = gcc$/;"	m
+CFLAGS	makefile	/^CFLAGS = $(shell pkg-config --cflags gtk+-3.0 vte-2.91 glib-2.0)$/;"	m
+FILE_PATH_COLUMN	main.c	/^#define FILE_PATH_COLUMN /;"	d	file:
+LDFLAGS	makefile	/^LDFLAGS = $(shell pkg-config --libs gtk+-3.0 vte-2.91 glib-2.0)$/;"	m
+OBJS	makefile	/^OBJS = $(SRCS:.c=.o)$/;"	m
+SRCS	makefile	/^SRCS = main.c$/;"	m
+TARGET	makefile	/^TARGET = app$/;"	m
+all	makefile	/^all: $(TARGET)$/;"	t
+base_dir	main.c	/^static char *base_dir;$/;"	v	typeref:typename:char *	file:
+clean	makefile	/^clean:$/;"	t
+compile_and_run	main.c	/^static void compile_and_run(const char *path, const char *language) {$/;"	f	typeref:typename:void	file:
+create_new_directory	main.c	/^static void create_new_directory(const char *dir_name) {$/;"	f	typeref:typename:void	file:
+create_new_file	main.c	/^static void create_new_file(const char *file_name) {$/;"	f	typeref:typename:void	file:
+create_tree_view	main.c	/^static GtkWidget* create_tree_view() {$/;"	f	typeref:typename:GtkWidget *	file:
+current_dir	main.c	/^static char *current_dir;$/;"	v	typeref:typename:char *	file:
+delete_selected_item	main.c	/^static void delete_selected_item() {$/;"	f	typeref:typename:void	file:
+display_directory	main.c	/^static void display_directory(const char *dir) {$/;"	f	typeref:typename:void	file:
+extract_first_directory	main.c	/^static char *extract_first_directory(const char *path) {$/;"	f	typeref:typename:char *	file:
+get_directory_depth	main.c	/^static int get_directory_depth(const char *dir) {$/;"	f	typeref:typename:int	file:
+get_language_from_path	main.c	/^static const char *get_language_from_path(const char *path) {$/;"	f	typeref:typename:const char *	file:
+handle_file_open_error	main.c	/^static void handle_file_open_error(const char *filepath) {$/;"	f	typeref:typename:void	file:
+has_extension	main.c	/^static gboolean has_extension(const char *filename, const char *extension) {$/;"	f	typeref:typename:gboolean	file:
+inotify_fd	main.c	/^static int inotify_fd;$/;"	v	typeref:typename:int	file:
+is_executable	main.c	/^gboolean is_executable(const char *path) {$/;"	f	typeref:typename:gboolean
+main	main.c	/^int main(int argc, char *argv[]) {$/;"	f	typeref:typename:int
+make_file_executable	main.c	/^static void make_file_executable(const char *path) {$/;"	f	typeref:typename:void	file:
+make_file_executable_menu	main.c	/^void make_file_executable_menu(GtkMenuItem *menu_item, gpointer user_data) {$/;"	f	typeref:typename:void
+make_file_not_executable	main.c	/^static void make_file_not_executable(const char *path) {$/;"	f	typeref:typename:void	file:
+make_file_not_executable_menu	main.c	/^void make_file_not_executable_menu(GtkMenuItem *menu_item, gpointer user_data) {$/;"	f	typeref:typename:void
+navigate_up_directory	main.c	/^static void navigate_up_directory() {$/;"	f	typeref:typename:void	file:
+on_button_press	main.c	/^static gboolean on_button_press(GtkWidget *widget, GdkEventButton *event, gpointer userdata) {$/;"	f	typeref:typename:gboolean	file:
+on_key_press	main.c	/^static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer userdata) {$/;"	f	typeref:typename:gboolean	file:
+on_row_activated	main.c	/^static void on_row_activated(GtkTreeView *treeview, GtkTreePath *path, GtkTreeViewColumn *col, g/;"	f	typeref:typename:void	file:
+on_window_destroy	main.c	/^static void on_window_destroy(GtkWidget *widget, gpointer data) {$/;"	f	typeref:typename:void	file:
+open_file_with_appropriate_application	main.c	/^static void open_file_with_appropriate_application(const char *filepath) {$/;"	f	typeref:typename:void	file:
+recursive_delete	main.c	/^static gboolean recursive_delete(const char *path) {$/;"	f	typeref:typename:gboolean	file:
+run_executable	main.c	/^void run_executable(GtkMenuItem *menu_item, gpointer user_data) {$/;"	f	typeref:typename:void
+show_confirmation_dialog	main.c	/^static gboolean show_confirmation_dialog(const char *message) {$/;"	f	typeref:typename:gboolean	file:
+show_deletion_dialog	main.c	/^static void show_deletion_dialog() {$/;"	f	typeref:typename:void	file:
+show_new_directory_dialog	main.c	/^static void show_new_directory_dialog() {$/;"	f	typeref:typename:void	file:
+show_new_file_dialog	main.c	/^static void show_new_file_dialog() {$/;"	f	typeref:typename:void	file:
+store	main.c	/^static GtkListStore *store;$/;"	v	typeref:typename:GtkListStore *	file:
+strip_html_markup	main.c	/^static char *strip_html_markup(const char *input) {$/;"	f	typeref:typename:char *	file:
+terminal	main.c	/^static VteTerminal *terminal;$/;"	v	typeref:typename:VteTerminal *	file:
+tree_view	main.c	/^static GtkWidget *tree_view, *window;$/;"	v	typeref:typename:GtkWidget *	file:
+window	main.c	/^static GtkWidget *tree_view, *window;$/;"	v	typeref:typename:GtkWidget *	file:
